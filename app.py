@@ -13,14 +13,12 @@ import json
 TZ = pytz.timezone('Asia/Tokyo')
 app = dash.Dash(__name__, external_stylesheets=[dbc.themes.FLATLY])
 
-# グリッド設定（8:00–20:00、15分粒度）
 START_H = 8
 END_H = 20
 TOTAL_MIN = (END_H - START_H) * 60
 PX_PER_MIN = 1
 GRID_CELL_MIN = 15
 
-# コミットメント色
 COMMIT_COLORS = {
     "Primary":   {"bg": "#0052CC", "text": "white"},
     "Secondary": {"bg": "#36B37E", "text": "white"},
@@ -47,7 +45,6 @@ events_init = [
      'start': dt_aware(2025, 8, 13, 15, 0).isoformat(),
      'end':   dt_aware(2025, 8, 13, 16, 0).isoformat(),
      'user_id': 'user_b', 'commitment': 'Primary'},
-    # 日跨りの例（許可）：金 19:30 → 土 08:30
     {'id': str(uuid.uuid4()), 'title': 'Overnight Maintenance',
      'start': dt_aware(2025, 8, 15, 19, 30).isoformat(),
      'end':   dt_aware(2025, 8, 16, 8, 30).isoformat(),
@@ -118,18 +115,15 @@ def week_range_for_anchor(anchor: datetime):
     return start, end
 
 def assign_lanes(day_items):
-    # 貪欲レーン割当
     items = sorted(day_items, key=lambda x: x['s'])
     lanes = []
     for it in items:
         for i, end in enumerate(lanes):
             if it['s'] >= end:
                 it['lane'] = i
-                lanes[i] = it['e']
-                break
+                lanes[i] = it['e']; break
         else:
-            it['lane'] = len(lanes)
-            lanes.append(it['e'])
+            it['lane'] = len(lanes); lanes.append(it['e'])
     return items, max(1, len(lanes))
 
 def generate_week_bars(anchor_dt: datetime, events_data):
@@ -139,12 +133,12 @@ def generate_week_bars(anchor_dt: datetime, events_data):
     header = dbc.Row(
         [dbc.Col("", width=1),
          dbc.Col(dbc.Row([dbc.Col(html.Div(d.strftime("%a %m/%d"),
-                                           className="text-center fw-bold day-col-header"))
+                                           id={'type':'week-header','day':d.strftime('%Y-%m-%d')},
+                                           className="text-center fw-bold day-col-header", style={"cursor":"pointer"}))
                           for d in days]), width=11)],
         className="mb-2"
     )
 
-    # 左：時間ラベル
     time_labels = [html.Div(f"{h:02d}:00",
                     style={"position":"absolute","top":f"{(h-START_H)*60*PX_PER_MIN}px",
                            "right":0,"transform":"translateY(-50%)","fontSize":"12px"})
@@ -153,7 +147,6 @@ def generate_week_bars(anchor_dt: datetime, events_data):
 
     day_columns = []
     for idx, d in enumerate(days):
-        # 当日の可視投影
         proj = []
         for ev in events_data:
             s, e = parse_iso(ev['start']), parse_iso(ev['end'])
@@ -168,7 +161,6 @@ def generate_week_bars(anchor_dt: datetime, events_data):
 
         items, lane_count = assign_lanes(proj)
 
-        # 背景
         bg = {"backgroundImage":"repeating-linear-gradient(to bottom, #F4F5F7 0px, #F4F5F7 59px, #DFE1E6 60px)",
               "backgroundSize":"100% 60px"}
 
@@ -234,40 +226,36 @@ def generate_week_bars(anchor_dt: datetime, events_data):
                                 cursor: ns-resize; background: rgba(255,255,255,0.35); }
     .drag-tooltip { position: fixed; pointer-events:none; background: #172B4D; color:white;
                     padding:4px 8px; border-radius:6px; font-size:12px; z-index:9999; opacity:0.92; }
+    .ghost-bar { position:absolute; left: 2px; right: 2px; background: rgba(0,82,204,0.25);
+                 border: 1px dashed rgba(0,82,204,0.6); border-radius:6px; pointer-events:none; }
     """)
 
     return html.Div([header, grid, css])
 
-# --- LLM（commitment 推定も返す） ---
+# --- LLM with commitment ---
 def dummy_llm_api(text):
     text_l = text.lower()
     now = datetime.now(TZ)
     title = "New Event"
     start_dt = now.replace(second=0, microsecond=0)
     duration = timedelta(hours=1)
-    # タイトル（引用）
     q = re.findall(r"['\"](.*?)['\"]", text_l)
     if q: title = q[0].strip().capitalize()
-    # today/tomorrow
     if "tomorrow" in text_l: start_dt = now + timedelta(days=1)
-    # 時刻
     m = re.search(r'(\d{1,2})(?::(\d{2}))?\s*(am|pm)?', text_l)
     if m:
         h = int(m.group(1)); mi = int(m.group(2) or 0); ap = m.group(3)
         if ap == 'pm' and h < 12: h += 12
         if ap == 'am' and h == 12: h = 0
         start_dt = start_dt.replace(hour=h, minute=mi)
-    # duration
     dm = re.search(r'for\s+(\d+)\s*(hour|minute)s?', text_l)
     if dm:
         n = int(dm.group(1)); unit = dm.group(2)
         duration = timedelta(hours=n) if unit=='hour' else timedelta(minutes=n)
-    # commitment 推定
     cm = "Primary"
     if "secondary" in text_l: cm = "Secondary"
     elif "observer" in text_l or "listen-only" in text_l: cm = "Observer"
     elif "tentative" in text_l or "maybe" in text_l: cm = "Tentative"
-
     start_dt = round_to_grid(start_dt, up=True); end_dt = round_to_grid(start_dt+duration, up=True)
     return {"title": title, "start": start_dt.strftime('%Y-%m-%dT%H:%M'),
             "end": end_dt.strftime('%Y-%m-%dT%H:%M'), "commitment": cm}
@@ -296,8 +284,11 @@ def create_event_modal():
                     ])
                 ]
             ),
-            dbc.ModalFooter([dbc.Button("Cancel", id="cancel-event-button", color="secondary"),
-                             dbc.Button("Save", id="save-event-button", color="primary")]),
+            dbc.ModalFooter([
+                dbc.Button("Delete", id="delete-event-button", color="danger", outline=True, disabled=True, className="me-auto"),
+                dbc.Button("Cancel", id="cancel-event-button", color="secondary"),
+                dbc.Button("Save", id="save-event-button", color="primary"),
+            ]),
         ], id="event-modal", is_open=False
     )
 
@@ -309,7 +300,9 @@ app.layout = dbc.Container(
                                                  'month': today_local.month,
                                                  'anchor': today_local.strftime('%Y-%m-%d')}),
         dcc.Store(id='events-store', data=events_init),
-        html.Div(id='drag-update-store', style={'display':'none'}),  # JS→Python 受け皿（childrenにJSON）
+        dcc.Store(id='editing-id', data=""),          # 編集対象のID
+        dcc.Store(id='ui-intent', data=""),           # JS→「月へ戻す」等の指示
+        dcc.Store(id='edit-open-store', data=""),     # JS→「このIDを編集」指示
 
         create_event_modal(),
 
@@ -323,7 +316,7 @@ app.layout = dbc.Container(
                         dbc.Button("<", id="prev-month-button", color="light"),
                         dbc.Button(">", id="next-month-button", color="light"),
                     ]),
-                    html.Span(id="current-month-year", className="mx-3 h4 align-middle"),
+                    html.Span(id="current-month-year", className="mx-3 h4 align-middle", style={"cursor":"pointer"}),
                 ], width="auto"),
                 dbc.Col(
                     dbc.RadioItems(
@@ -352,15 +345,14 @@ app.layout = dbc.Container(
             ], width=12), className="mt-auto"
         ),
 
-        # クライアントJS：ドラッグ＆ツールチップ＆横移動＆store更新
+        # クライアントJS：横ドラッグゴースト / ツールチップ / Esc&ヘッダで月へ / ダブルクリック編集
         html.Script(f"""
 (function(){{
-  const PX_PER_MIN = {PX_PER_MIN};
-  const START_H = {START_H};
-  const GRID = {GRID_CELL_MIN};
+  const PX_PER_MIN = {PX_PER_MIN}, START_H = {START_H}, GRID = {GRID_CELL_MIN};
   const TOTAL_PX = {(END_H-START_H)*60*PX_PER_MIN};
 
-  let tooltip;
+  let tooltip; let ghost; let ghostHost;
+
   function ensureTooltip(){{
     if(!tooltip){{
       tooltip = document.createElement('div');
@@ -370,33 +362,34 @@ app.layout = dbc.Container(
     }}
     return tooltip;
   }}
-  function showTip(x,y,text){{
-    const t = ensureTooltip();
-    t.textContent = text;
-    t.style.left = (x+12)+'px';
-    t.style.top = (y+12)+'px';
-    t.style.display = 'block';
-  }}
-  function hideTip(){{
-    if(tooltip) tooltip.style.display = 'none';
-  }}
-  function nearestGridMin(mins){ return Math.round(mins/GRID)*GRID; }
-  function clamp(v,lo,hi){ return Math.max(lo, Math.min(hi,v)); }
-  function pxToMin(px){ return px / PX_PER_MIN; }
-  function minToPx(m){ return m * PX_PER_MIN; }
+  function showTip(x,y,text){ const t=ensureTooltip(); t.textContent=text; t.style.left=(x+12)+'px'; t.style.top=(y+12)+'px'; t.style.display='block'; }
+  function hideTip(){ if(tooltip) tooltip.style.display='none'; }
 
-  function toLocalISO(d){{
-    const pad=(n)=> String(n).padStart(2,'0');
-    return d.getFullYear()+"-"+pad(d.getMonth()+1)+"-"+pad(d.getDate())+"T"+pad(d.getHours())+":"+pad(d.getMinutes());
+  function ensureGhost(host){{
+    if(!ghost || ghostHost!==host){{
+      removeGhost();
+      ghost = document.createElement('div');
+      ghost.className = 'ghost-bar';
+      host.querySelector('div[style*="position: relative"]').appendChild(ghost);
+      ghostHost = host;
+    }}
+    return ghost;
+  }}
+  function removeGhost(){{
+    if(ghost && ghost.parentNode) ghost.parentNode.removeChild(ghost);
+    ghost=null; ghostHost=null;
   }}
 
-  function pickDayByPoint(clientX, clientY){{
+  function nearestGridMin(m){ return Math.round(m/GRID)*GRID; }
+  function clamp(v,a,b){ return Math.max(a, Math.min(b, v)); }
+  function pxToMin(px){ return px / {PX_PER_MIN}; }
+  function toLocalISO(d){ const p=n=>String(n).padStart(2,'0'); return d.getFullYear()+"-"+p(d.getMonth()+1)+"-"+p(d.getDate())+"T"+p(d.getHours())+":"+p(d.getMinutes()); }
+
+  function pickDayColByPoint(x,y){{
     const cols = Array.from(document.querySelectorAll('.day-col'));
     for(const col of cols){{
       const r = col.getBoundingClientRect();
-      if(clientX >= r.left && clientX <= r.right && clientY >= r.top && clientY <= r.bottom){{
-        return {{day: col.dataset.day, index: parseInt(col.dataset.index)}}
-      }}
+      if(x>=r.left && x<=r.right && y>=r.top && y<=r.bottom) return col;
     }}
     return null;
   }}
@@ -404,23 +397,39 @@ app.layout = dbc.Container(
   function setup(){
     const root = document.getElementById('calendar-output');
     if(!root) return;
+
+    // Escで月へ
+    document.onkeydown = (e)=>{
+      if(e.key === 'Escape'){
+        const ui = document.getElementById('ui-intent');
+        if(ui){ ui.textContent = 'to-month'; ui.dispatchEvent(new Event('input')); }
+      }
+    };
+
+    // 期間ラベルクリックで月へ
+    const header = document.getElementById('current-month-year');
+    if(header){
+      header.onclick = ()=>{{ const ui = document.getElementById('ui-intent'); if(ui){{ ui.textContent='to-month'; ui.dispatchEvent(new Event('input')); }} }};
+    }
+
     const bars = root.querySelectorAll('.event-bar');
     bars.forEach(bar=>{
-      bar.onmousedown = null;
-      const handle = bar.querySelector('.resize-handle');
-      if(handle) handle.onmousedown = null;
+      bar.onmousedown = null; const handle = bar.querySelector('.resize-handle'); if(handle) handle.onmousedown = null;
+      let dragging=false, resizing=false, startY=0, origTop=0, origH=0;
 
-      let dragging=false, resizing=false;
-      let startY=0, startX=0, origTop=0, origHeight=0, origDay=bar.dataset.day, origDayIdx=parseInt(bar.dataset.dayIndex);
+      // ダブルクリックで編集オープン
+      bar.ondblclick = ()=>{
+        const sink = document.getElementById('edit-open-store');
+        if(sink){ sink.textContent = bar.dataset.id; sink.dispatchEvent(new Event('input')); }
+      };
 
-      // 移動ドラッグ
+      // ドラッグ移動
       bar.onmousedown = (ev)=>{
         if(ev.target.classList.contains('resize-handle')) return;
-        ev.preventDefault();
-        dragging=true; bar.classList.add('dragging');
-        startY=ev.clientY; startX=ev.clientX;
-        origTop = parseFloat(getComputedStyle(bar).top);
-        document.onmousemove=(mv)=>{
+        ev.preventDefault(); dragging=true; bar.classList.add('dragging');
+        startY = ev.clientY; origTop = parseFloat(getComputedStyle(bar).top);
+
+        document.onmousemove = (mv)=>{
           if(!dragging) return;
           const dy = mv.clientY - startY;
           let newTop = origTop + dy;
@@ -428,82 +437,78 @@ app.layout = dbc.Container(
           newTop = clamp(newTop, 0, maxTop);
           bar.style.top = newTop + 'px';
 
-          // ツールチップ：現在の候補時間＆日
           const topMin = nearestGridMin(pxToMin(newTop));
-          const dayPick = pickDayByPoint(mv.clientX, mv.clientY) || {{day: origDay, index: origDayIdx}};
-          const s = new Date(dayPick.day+'T00:00:00'); s.setHours(START_H,0,0,0); s.setMinutes(s.getMinutes()+topMin);
+          const host = pickDayColByPoint(mv.clientX, mv.clientY) || document.querySelector(`.day-col[data-day="${bar.dataset.day}"]`);
+          const hostRel = host.querySelector('div[style*="position: relative"]');
           const durMin = nearestGridMin(pxToMin(parseFloat(getComputedStyle(bar).height)));
-          const e = new Date(s.getTime() + durMin*60000);
-          showTip(mv.clientX, mv.clientY, dayPick.day+'  '+s.toTimeString().slice(0,5)+'–'+e.toTimeString().slice(0,5));
+          // ゴーストバー
+          const g = ensureGhost(host);
+          g.style.top = (topMin)+'px';
+          g.style.height = Math.max(durMin, GRID)+'px';
+
+          const s = new Date(host.dataset.day+'T00:00:00'); s.setHours({START_H},0,0,0); s.setMinutes(s.getMinutes()+topMin);
+          const e = new Date(s.getTime() + Math.max(durMin, GRID)*60000);
+          showTip(mv.clientX, mv.clientY, host.dataset.day+'  '+s.toTimeString().slice(0,5)+'–'+e.toTimeString().slice(0,5));
         };
-        document.onmouseup=(up)=>{
-          if(!dragging) return;
-          dragging=false; bar.classList.remove('dragging');
-          document.onmousemove=null; document.onmouseup=null; hideTip();
+        document.onmouseup = (up)=>{
+          if(!dragging) return; dragging=false; bar.classList.remove('dragging');
+          document.onmousemove=null; document.onmouseup=null; hideTip(); removeGhost();
 
           const newTopPx = parseFloat(getComputedStyle(bar).top);
-          let mins = nearestGridMin(pxToMin(newTopPx));
-          const dayPick = pickDayByPoint(up.clientX, up.clientY) || {{day: origDay, index: origDayIdx}};
+          const mins = nearestGridMin(pxToMin(newTopPx));
+          const host = pickDayColByPoint(up.clientX, up.clientY) || document.querySelector(`.day-col[data-day="${bar.dataset.day}"]`);
+          const s = new Date(host.dataset.day+'T00:00:00'); s.setHours({START_H},0,0,0); s.setMinutes(s.getMinutes()+mins);
+          const durMin = nearestGridMin(pxToMin(parseFloat(getComputedStyle(bar).height)));
+          const e = new Date(s.getTime() + Math.max(durMin, GRID)*60000);
 
-          const s = new Date(dayPick.day+'T00:00:00'); s.setHours(START_H,0,0,0); s.setMinutes(s.getMinutes()+mins);
-          const heightPx = parseFloat(getComputedStyle(bar).height);
-          let durMins = nearestGridMin(pxToMin(heightPx)); if(durMins<GRID) durMins=GRID;
-          const e = new Date(s.getTime()+durMins*60000);
-
-          // 送信
-          const payload = {{id: bar.dataset.id, start: toLocalISO(s), end: toLocalISO(e)}};
           const sink = document.getElementById('drag-update-store');
-          if(sink) {{ sink.textContent = JSON.stringify(payload); sink.dispatchEvent(new Event('input')); }}
+          if(sink){ sink.textContent = JSON.stringify({{id: bar.dataset.id, start: toLocalISO(s), end: toLocalISO(e)}}); sink.dispatchEvent(new Event('input')); }
         };
       };
 
       // リサイズ（下辺）
       if(handle){
         handle.onmousedown = (ev)=>{
-          ev.preventDefault();
-          resizing=true; bar.classList.add('dragging');
-          startY=ev.clientY; origHeight = parseFloat(getComputedStyle(bar).height);
-          document.onmousemove=(mv)=>{
+          ev.preventDefault(); resizing=true; bar.classList.add('dragging'); startY = ev.clientY; origH = parseFloat(getComputedStyle(bar).height);
+          document.onmousemove = (mv)=>{
             if(!resizing) return;
             const dy = mv.clientY - startY;
-            let newH = origHeight + dy;
+            let newH = origH + dy;
             const maxH = TOTAL_PX - parseFloat(getComputedStyle(bar).top);
-            newH = clamp(newH, GRID, maxH);
-            bar.style.height = newH + 'px';
+            newH = clamp(newH, GRID, maxH); bar.style.height = newH + 'px';
 
-            // ツールチップ
-            const topPx = parseFloat(getComputedStyle(bar).top);
-            const topMin = nearestGridMin(pxToMin(topPx));
-            const dayPick = pickDayByPoint(mv.clientX, mv.clientY) || {{day: bar.dataset.day, index: parseInt(bar.dataset.dayIndex)}};
-            const s = new Date(dayPick.day+'T00:00:00'); s.setHours(START_H,0,0,0); s.setMinutes(s.getMinutes()+topMin);
-            const durMin = nearestGridMin(pxToMin(newH));
-            const e = new Date(s.getTime()+durMin*60000);
-            showTip(mv.clientX, mv.clientY, dayPick.day+'  '+s.toTimeString().slice(0,5)+'–'+e.toTimeString().slice(0,5));
+            const topMin = nearestGridMin(pxToMin(parseFloat(getComputedStyle(bar).top)));
+            const host = pickDayColByPoint(mv.clientX, mv.clientY) || document.querySelector(`.day-col[data-day="${bar.dataset.day}"]`);
+            const g = ensureGhost(host);
+            g.style.top = (topMin)+'px'; g.style.height = nearestGridMin(pxToMin(newH))+'px';
+
+            const s = new Date(host.dataset.day+'T00:00:00'); s.setHours({START_H},0,0,0); s.setMinutes(s.getMinutes()+topMin);
+            const e = new Date(s.getTime() + nearestGridMin(pxToMin(newH))*60000);
+            showTip(mv.clientX, mv.clientY, host.dataset.day+'  '+s.toTimeString().slice(0,5)+'–'+e.toTimeString().slice(0,5));
           };
-          document.onmouseup=(up)=>{
-            if(!resizing) return;
-            resizing=false; bar.classList.remove('dragging');
-            document.onmousemove=null; document.onmouseup=null; hideTip();
+          document.onmouseup = (up)=>{
+            if(!resizing) return; resizing=false; bar.classList.remove('dragging');
+            document.onmousemove=null; document.onmouseup=null; hideTip(); removeGhost();
 
             const topPx = parseFloat(getComputedStyle(bar).top);
             const heightPx = parseFloat(getComputedStyle(bar).height);
-            let mins = nearestGridMin(pxToMin(topPx));
-            let durMins = nearestGridMin(pxToMin(heightPx)); if(durMins<GRID) durMins=GRID;
+            const mins = nearestGridMin(pxToMin(topPx));
+            const durMin = nearestGridMin(pxToMin(heightPx));
+            const host = pickDayColByPoint(up.clientX, up.clientY) || document.querySelector(`.day-col[data-day="${bar.dataset.day}"]`);
+            const s = new Date(host.dataset.day+'T00:00:00'); s.setHours({START_H},0,0,0); s.setMinutes(s.getMinutes()+mins);
+            const e = new Date(s.getTime() + Math.max(durMin, GRID)*60000);
 
-            const dayPick = pickDayByPoint(up.clientX, up.clientY) || {{day: bar.dataset.day, index: parseInt(bar.dataset.dayIndex)}};
-            const s = new Date(dayPick.day+'T00:00:00'); s.setHours(START_H,0,0,0); s.setMinutes(s.getMinutes()+mins);
-            const e = new Date(s.getTime()+durMins*60000);
-
-            const payload = {{id: bar.dataset.id, start: toLocalISO(s), end: toLocalISO(e)}};
             const sink = document.getElementById('drag-update-store');
-            if(sink) {{ sink.textContent = JSON.stringify(payload); sink.dispatchEvent(new Event('input')); }}
+            if(sink){ sink.textContent = JSON.stringify({{id: bar.dataset.id, start: toLocalISO(s), end: toLocalISO(e)}}); sink.dispatchEvent(new Event('input')); }
           };
         };
       }
     });
+
+    // 週ヘッダ（日名ラベル）クリックでその日の週に留まる→（既に週表示なので）特に無し
+    // 月ビューでのセルクリック→週ジャンプはサーバ側コールバックで処理済み
   }
 
-  // DOM更新のたびにセットアップ
   const obs = new MutationObserver(()=>setup());
   obs.observe(document.documentElement, {{childList:true, subtree:true}});
   setup();
@@ -585,8 +590,22 @@ def jump_to_week(n_clicks, view_mode):
     d = datetime.strptime(date_str, '%Y-%m-%d')
     return {'year': d.year, 'month': d.month, 'anchor': date_str}, 'week'
 
-# 週ビューでの日付セルクリック → モーダル（現在時刻起点）
+# Esc / ヘッダクリック → 週→月へ
 @app.callback(
+    Output('view-switch','value', allow_duplicate=True),
+    Input('ui-intent','children'),
+    State('current-date-store','data'),
+    prevent_initial_call=True
+)
+def to_month_from_ui(intent, data):
+    if not intent or intent != 'to-month': raise dash.exceptions.PreventUpdate
+    # anchorの年月を月ビューへ
+    return 'month'
+
+# 週ビューのセルクリック → 新規作成モーダル（現在時刻プリセット）
+@app.callback(
+    Output('editing-id','data', allow_duplicate=True),
+    Output('delete-event-button','disabled', allow_duplicate=True),
     Output('event-modal','is_open', allow_duplicate=True),
     Output('modal-error','is_open', allow_duplicate=True),
     Output('modal-error','children', allow_duplicate=True),
@@ -606,51 +625,99 @@ def open_modal_from_week(n_clicks, view_mode):
     now = datetime.now(TZ)
     s = TZ.localize(datetime.strptime(date_str, '%Y-%m-%d')).replace(hour=now.hour, minute=now.minute, second=0, microsecond=0)
     s = round_to_grid(s, up=True); e = round_to_grid(s + timedelta(hours=1), up=True)
-    return True, False, "", "", s.strftime('%Y-%m-%dT%H:%M'), e.strftime('%Y-%m-%dT%H:%M'), "Primary"
+    return "", True, True, False, "", "", s.strftime('%Y-%m-%dT%H:%M'), e.strftime('%Y-%m-%dT%H:%M'), "Primary"
 
-# Save/Cancel（最大24h、日跨り許可）
+# JSからの「編集オープン」要求（ダブルクリック）
+@app.callback(
+    Output('editing-id','data', allow_duplicate=True),
+    Output('delete-event-button','disabled', allow_duplicate=True),
+    Output('event-modal','is_open', allow_duplicate=True),
+    Output('modal-error','is_open', allow_duplicate=True),
+    Output('modal-error','children', allow_duplicate=True),
+    Output('event-title','value', allow_duplicate=True),
+    Output('event-start-date','value', allow_duplicate=True),
+    Output('event-end-date','value', allow_duplicate=True),
+    Output('event-commitment','value', allow_duplicate=True),
+    Input('edit-open-store','children'),
+    State('events-store','data'),
+    prevent_initial_call=True
+)
+def open_modal_for_edit(edit_id, ev_data):
+    if not edit_id: raise dash.exceptions.PreventUpdate
+    target = next((e for e in ev_data if e['id'] == edit_id), None)
+    if not target: raise dash.exceptions.PreventUpdate
+    return (edit_id, False, True, False, "",
+            target.get('title',''),
+            parse_iso(target['start']).strftime('%Y-%m-%dT%H:%M'),
+            parse_iso(target['end']).strftime('%Y-%m-%dT%H:%M'),
+            target.get('commitment','Primary'))
+
+# Save / Cancel / Delete
 @app.callback(
     Output('event-modal','is_open', allow_duplicate=True),
     Output('modal-error','is_open', allow_duplicate=True),
     Output('modal-error','children', allow_duplicate=True),
     Output('events-store','data', allow_duplicate=True),
+    Output('editing-id','data', allow_duplicate=True),
     Input('cancel-event-button','n_clicks'),
     Input('save-event-button','n_clicks'),
+    Input('delete-event-button','n_clicks'),
     State('event-title','value'),
     State('event-start-date','value'),
     State('event-end-date','value'),
     State('event-commitment','value'),
     State('events-store','data'),
+    State('editing-id','data'),
     prevent_initial_call=True
 )
-def close_or_save_modal(cancel_c, save_c, title, start_val, end_val, commitment, ev_data):
+def close_save_delete(cancel_c, save_c, delete_c, title, start_val, end_val, commitment, ev_data, editing_id):
     ctx = dash.callback_context
     if not ctx.triggered: raise dash.exceptions.PreventUpdate
-    if ctx.triggered_id == 'save-event-button':
+    tid = ctx.triggered_id
+
+    # Delete
+    if tid == 'delete-event-button':
+        if not editing_id: return False, False, "", dash.no_update, ""
+        new_list = [e for e in ev_data if e['id'] != editing_id]
+        return False, False, "", new_list, ""
+
+    # Save
+    if tid == 'save-event-button':
         if not start_val or not end_val:
-            return True, True, "Start/End は必須です。", dash.no_update
+            return True, True, "Start/End は必須です。", dash.no_update, editing_id
         try:
             s = TZ.localize(datetime.strptime(start_val, '%Y-%m-%dT%H:%M'))
             e = TZ.localize(datetime.strptime(end_val,   '%Y-%m-%dT%H:%M'))
         except Exception:
-            return True, True, "日付の形式が不正です。", dash.no_update
+            return True, True, "日付の形式が不正です。", dash.no_update, editing_id
         if e < s:
-            return True, True, "終了は開始以上である必要があります。", dash.no_update
-        # 最大24時間まで（日跨り許可）
+            return True, True, "終了は開始以上である必要があります。", dash.no_update, editing_id
         if (e - s) > timedelta(hours=24):
-            return True, True, "最長24時間までです。", dash.no_update
+            return True, True, "最長24時間までです。", dash.no_update, editing_id
         s = round_to_grid(s, up=False); e = round_to_grid(e, up=True)
-        new_event = {'id': str(uuid.uuid4()), 'title': (title or "New Event").strip(),
-                     'start': s.isoformat(), 'end': e.isoformat(),
-                     'user_id': 'user_a', 'commitment': commitment or "Primary"}
-        new_list = copy.deepcopy(ev_data) if isinstance(ev_data, list) else []
-        new_list.append(new_event)
-        return False, False, "", new_list
-    else:
-        return False, False, "", dash.no_update
 
-# LLM → モーダル（commitment もプリセット）
+        new_list = copy.deepcopy(ev_data) if isinstance(ev_data, list) else []
+        if editing_id:
+            for i, ev in enumerate(new_list):
+                if ev['id'] == editing_id:
+                    new_list[i] = {**ev, 'title': (title or "New Event").strip(),
+                                   'start': s.isoformat(), 'end': e.isoformat(),
+                                   'commitment': commitment or "Primary"}
+                    break
+        else:
+            new_list.append({'id': str(uuid.uuid4()),
+                             'title': (title or "New Event").strip(),
+                             'start': s.isoformat(), 'end': e.isoformat(),
+                             'user_id': 'user_a', 'commitment': commitment or "Primary"})
+        return False, False, "", new_list, ""
+
+    # Cancel
+    return False, False, "", dash.no_update, editing_id
+
+# LLM → 新規作成プリセット
 @app.callback(
+    Output('editing-id','data', allow_duplicate=True),
+    Output('delete-event-button','disabled', allow_duplicate=True),
     Output('event-modal','is_open', allow_duplicate=True),
     Output('modal-error','is_open', allow_duplicate=True),
     Output('modal-error','children', allow_duplicate=True),
@@ -667,16 +734,17 @@ def llm_preset_modal(n_clicks, text):
     if not text: raise dash.exceptions.PreventUpdate
     parsed = dummy_llm_api(text)
     msg = f"LLM parsed → Title: {parsed['title']}, Start: {parsed['start']}, End: {parsed['end']}, Commitment: {parsed['commitment']}"
-    return True, False, "", parsed['title'], parsed['start'], parsed['end'], parsed['commitment'], msg
+    return "", True, True, False, "", parsed['title'], parsed['start'], parsed['end'], parsed['commitment'], msg
 
-# JSからのドラッグ更新（JSON文字列を children 経由で受ける）
+# JSドラッグ更新
 @app.callback(
     Output('events-store','data', allow_duplicate=True),
-    Input('drag-update-store','children'),
+    Input('drag-update-store','input'),
+    State('drag-update-store','textContent'),
     State('events-store','data'),
     prevent_initial_call=True
 )
-def apply_drag_update(raw, ev_data):
+def apply_drag_update(_evt, raw, ev_data):
     if not raw: raise dash.exceptions.PreventUpdate
     try:
         payload = json.loads(raw)

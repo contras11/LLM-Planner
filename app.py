@@ -18,6 +18,7 @@ END_H = 20
 TOTAL_MIN = (END_H - START_H) * 60
 PX_PER_MIN = 1
 GRID_CELL_MIN = 15
+HIST_MAX = 50  # Undo履歴の最大数
 
 COMMIT_COLORS = {
     "Primary":   {"bg": "#0052CC", "text": "white"},
@@ -26,30 +27,8 @@ COMMIT_COLORS = {
     "Tentative": {"bg": "#7A869A", "text": "white"},
 }
 
-# --- Sample events ---
-def dt_aware(y, m, d, H, M): return TZ.localize(datetime(y, m, d, H, M))
-events_init = [
-    {'id': str(uuid.uuid4()), 'title': 'Team Standup',
-     'start': dt_aware(2025, 8, 11, 10, 0).isoformat(),
-     'end':   dt_aware(2025, 8, 11, 10, 15).isoformat(),
-     'user_id': 'user_a', 'commitment': 'Primary'},
-    {'id': str(uuid.uuid4()), 'title': 'Design Review',
-     'start': dt_aware(2025, 8, 11, 14, 0).isoformat(),
-     'end':   dt_aware(2025, 8, 11, 15, 30).isoformat(),
-     'user_id': 'user_a', 'commitment': 'Primary'},
-    {'id': str(uuid.uuid4()), 'title': '1-on-1 with Manager',
-     'start': dt_aware(2025, 8, 13, 11, 0).isoformat(),
-     'end':   dt_aware(2025, 8, 13, 11, 30).isoformat(),
-     'user_id': 'user_b', 'commitment': 'Secondary'},
-    {'id': str(uuid.uuid4()), 'title': '[User B] Project Kick-off',
-     'start': dt_aware(2025, 8, 13, 15, 0).isoformat(),
-     'end':   dt_aware(2025, 8, 13, 16, 0).isoformat(),
-     'user_id': 'user_b', 'commitment': 'Primary'},
-    {'id': str(uuid.uuid4()), 'title': 'Overnight Maintenance',
-     'start': dt_aware(2025, 8, 15, 19, 30).isoformat(),
-     'end':   dt_aware(2025, 8, 16, 8, 30).isoformat(),
-     'user_id': 'all', 'commitment': 'Observer'},
-]
+# --- 初期イベント：空（サンプル削除） ---
+events_init = []  # ← 空にしました
 
 # --- Helpers ---
 def parse_iso(s: str) -> datetime:
@@ -145,6 +124,7 @@ def generate_week_bars(anchor_dt: datetime, events_data):
                    for h in range(START_H, END_H+1)]
     time_axis = html.Div(time_labels, style={"position":"relative","height":f"{TOTAL_MIN*PX_PER_MIN}px"})
 
+    # 当日の可視投影→レーン割り当て→バー生成
     day_columns = []
     for idx, d in enumerate(days):
         proj = []
@@ -232,7 +212,7 @@ def generate_week_bars(anchor_dt: datetime, events_data):
 
     return html.Div([header, grid, css])
 
-# --- LLM with commitment ---
+# --- LLM with commitment (簡易) ---
 def dummy_llm_api(text):
     text_l = text.lower()
     now = datetime.now(TZ)
@@ -300,14 +280,18 @@ app.layout = dbc.Container(
                                                  'month': today_local.month,
                                                  'anchor': today_local.strftime('%Y-%m-%d')}),
         dcc.Store(id='events-store', data=events_init),
-        dcc.Store(id='editing-id', data=""),          # 編集対象のID
-        dcc.Store(id='ui-intent', data=""),           # JS→「月へ戻す」等の指示
-        dcc.Store(id='edit-open-store', data=""),     # JS→「このIDを編集」指示
+        dcc.Store(id='history-store', data=[]),  # Undo stack（各要素が events のスナップショット）
+        dcc.Store(id='future-store', data=[]),   # Redo stack
+        dcc.Store(id='editing-id', data=""),
+        dcc.Store(id='ui-intent', data=""),
+        dcc.Store(id='edit-open-store', data=""),
+        html.Div(id='drag-update-store', style={'display':'none'}),
 
         create_event_modal(),
 
         dbc.Row(dbc.Col(html.H1("Jules' Calendar", className="text-primary my-4"), width=12), align="center"),
 
+        # Toolbar（Undo/Redoボタンを追加）
         dbc.Row(
             [
                 dbc.Col([
@@ -315,6 +299,8 @@ app.layout = dbc.Container(
                         dbc.Button("Today", id="today-button", color="light"),
                         dbc.Button("<", id="prev-month-button", color="light"),
                         dbc.Button(">", id="next-month-button", color="light"),
+                        dbc.Button("Undo", id="undo-button", color="secondary", outline=True, disabled=True, className="ms-2"),
+                        dbc.Button("Redo", id="redo-button", color="secondary", outline=True, disabled=True),
                     ]),
                     html.Span(id="current-month-year", className="mx-3 h4 align-middle", style={"cursor":"pointer"}),
                 ], width="auto"),
@@ -326,7 +312,7 @@ app.layout = dbc.Container(
                         labelClassName="btn btn-outline-primary",
                         labelCheckedClassName="active",
                         options=[{'label':'Month','value':'month'},{'label':'Week','value':'week'}],
-                        value='week'
+                        value='week'  # ← デフォルトで週ビュー
                     ), width="auto"
                 ),
             ], justify="between", className="mb-3"
@@ -345,7 +331,7 @@ app.layout = dbc.Container(
             ], width=12), className="mt-auto"
         ),
 
-        # クライアントJS：横ドラッグゴースト / ツールチップ / Esc&ヘッダで月へ / ダブルクリック編集
+        # クライアントJS：横ドラッグゴースト / ツールチップ / Esc&ヘッダで月へ / ダブルクリック編集 / Ctrl+Z/Y
         html.Script(f"""
 (function(){{
   const PX_PER_MIN = {PX_PER_MIN}, START_H = {START_H}, GRID = {GRID_CELL_MIN};
@@ -362,8 +348,8 @@ app.layout = dbc.Container(
     }}
     return tooltip;
   }}
-  function showTip(x,y,text){ const t=ensureTooltip(); t.textContent=text; t.style.left=(x+12)+'px'; t.style.top=(y+12)+'px'; t.style.display='block'; }
-  function hideTip(){ if(tooltip) tooltip.style.display='none'; }
+  function showTip(x,y,text){{ const t=ensureTooltip(); t.textContent=text; t.style.left=(x+12)+'px'; t.style.top=(y+12)+'px'; t.style.display='block'; }}
+  function hideTip(){{ if(tooltip) tooltip.style.display='none'; }}
 
   function ensureGhost(host){{
     if(!ghost || ghostHost!==host){{
@@ -375,15 +361,12 @@ app.layout = dbc.Container(
     }}
     return ghost;
   }}
-  function removeGhost(){{
-    if(ghost && ghost.parentNode) ghost.parentNode.removeChild(ghost);
-    ghost=null; ghostHost=null;
-  }}
+  function removeGhost(){{ if(ghost && ghost.parentNode) ghost.parentNode.removeChild(ghost); ghost=null; ghostHost=null; }}
 
-  function nearestGridMin(m){ return Math.round(m/GRID)*GRID; }
-  function clamp(v,a,b){ return Math.max(a, Math.min(b, v)); }
-  function pxToMin(px){ return px / {PX_PER_MIN}; }
-  function toLocalISO(d){ const p=n=>String(n).padStart(2,'0'); return d.getFullYear()+"-"+p(d.getMonth()+1)+"-"+p(d.getDate())+"T"+p(d.getHours())+":"+p(d.getMinutes()); }
+  function nearestGridMin(m){{ return Math.round(m/GRID)*GRID; }}
+  function clamp(v,a,b){{ return Math.max(a, Math.min(b, v)); }}
+  function pxToMin(px){{ return px / {PX_PER_MIN}; }}
+  function toLocalISO(d){{ const p=n=>String(n).padStart(2,'0'); return d.getFullYear()+"-"+p(d.getMonth()+1)+"-"+p(d.getDate())+"T"+p(d.getHours())+":"+p(d.getMinutes()); }}
 
   function pickDayColByPoint(x,y){{
     const cols = Array.from(document.querySelectorAll('.day-col'));
@@ -394,42 +377,48 @@ app.layout = dbc.Container(
     return null;
   }}
 
-  function setup(){
+  function setup(){{
     const root = document.getElementById('calendar-output');
     if(!root) return;
 
     // Escで月へ
-    document.onkeydown = (e)=>{
-      if(e.key === 'Escape'){
-        const ui = document.getElementById('ui-intent');
-        if(ui){ ui.textContent = 'to-month'; ui.dispatchEvent(new Event('input')); }
-      }
-    };
+    document.onkeydown = (e)=>{{
+      const ui = document.getElementById('ui-intent');
+      const isMac = navigator.platform.toUpperCase().indexOf('MAC')>=0;
+      if(e.key === 'Escape'){{ if(ui){{ ui.textContent = 'to-month'; ui.dispatchEvent(new Event('input')); }} }}
+      // Undo/Redo
+      if((isMac && e.metaKey && e.key.toLowerCase()==='z') || (!isMac && e.ctrlKey && e.key.toLowerCase()==='z')){{
+        e.preventDefault(); if(ui){{ ui.textContent = 'undo'; ui.dispatchEvent(new Event('input')); }}
+      }}
+      if((isMac && e.metaKey && e.key.toLowerCase()==='y') || (!isMac && e.ctrlKey && e.key.toLowerCase()==='y')){{
+        e.preventDefault(); if(ui){{ ui.textContent = 'redo'; ui.dispatchEvent(new Event('input')); }}
+      }}
+    }};
 
     // 期間ラベルクリックで月へ
     const header = document.getElementById('current-month-year');
-    if(header){
+    if(header){{
       header.onclick = ()=>{{ const ui = document.getElementById('ui-intent'); if(ui){{ ui.textContent='to-month'; ui.dispatchEvent(new Event('input')); }} }};
-    }
+    }}
 
     const bars = root.querySelectorAll('.event-bar');
-    bars.forEach(bar=>{
+    bars.forEach(bar=>{{
       bar.onmousedown = null; const handle = bar.querySelector('.resize-handle'); if(handle) handle.onmousedown = null;
-      let dragging=false, resizing=false, startY=0, origTop=0, origH=0;
+      let dragging=false, resizing=false, startY=0, origTop=0, origH=0, origDay=bar.dataset.day, origDayIdx=parseInt(bar.dataset.dayIndex);
 
       // ダブルクリックで編集オープン
-      bar.ondblclick = ()=>{
+      bar.ondblclick = ()=>{{
         const sink = document.getElementById('edit-open-store');
-        if(sink){ sink.textContent = bar.dataset.id; sink.dispatchEvent(new Event('input')); }
-      };
+        if(sink){{ sink.textContent = bar.dataset.id; sink.dispatchEvent(new Event('input')); }}
+      }};
 
       // ドラッグ移動
-      bar.onmousedown = (ev)=>{
+      bar.onmousedown = (ev)=>{{
         if(ev.target.classList.contains('resize-handle')) return;
         ev.preventDefault(); dragging=true; bar.classList.add('dragging');
         startY = ev.clientY; origTop = parseFloat(getComputedStyle(bar).top);
 
-        document.onmousemove = (mv)=>{
+        document.onmousemove = (mv)=>{{
           if(!dragging) return;
           const dy = mv.clientY - startY;
           let newTop = origTop + dy;
@@ -438,55 +427,51 @@ app.layout = dbc.Container(
           bar.style.top = newTop + 'px';
 
           const topMin = nearestGridMin(pxToMin(newTop));
-          const host = pickDayColByPoint(mv.clientX, mv.clientY) || document.querySelector(`.day-col[data-day="${bar.dataset.day}"]`);
-          const hostRel = host.querySelector('div[style*="position: relative"]');
+          const host = pickDayColByPoint(mv.clientX, mv.clientY) || document.querySelector(`.day-col[data-day="${{bar.dataset.day}}"]`);
           const durMin = nearestGridMin(pxToMin(parseFloat(getComputedStyle(bar).height)));
-          // ゴーストバー
           const g = ensureGhost(host);
-          g.style.top = (topMin)+'px';
-          g.style.height = Math.max(durMin, GRID)+'px';
+          g.style.top = (topMin)+'px'; g.style.height = Math.max(durMin, GRID)+'px';
 
           const s = new Date(host.dataset.day+'T00:00:00'); s.setHours({START_H},0,0,0); s.setMinutes(s.getMinutes()+topMin);
           const e = new Date(s.getTime() + Math.max(durMin, GRID)*60000);
           showTip(mv.clientX, mv.clientY, host.dataset.day+'  '+s.toTimeString().slice(0,5)+'–'+e.toTimeString().slice(0,5));
-        };
-        document.onmouseup = (up)=>{
+        }};
+        document.onmouseup = (up)=>{{
           if(!dragging) return; dragging=false; bar.classList.remove('dragging');
           document.onmousemove=null; document.onmouseup=null; hideTip(); removeGhost();
 
           const newTopPx = parseFloat(getComputedStyle(bar).top);
           const mins = nearestGridMin(pxToMin(newTopPx));
-          const host = pickDayColByPoint(up.clientX, up.clientY) || document.querySelector(`.day-col[data-day="${bar.dataset.day}"]`);
+          const host = pickDayColByPoint(up.clientX, up.clientY) || document.querySelector(`.day-col[data-day="${{bar.dataset.day}}"]`);
           const s = new Date(host.dataset.day+'T00:00:00'); s.setHours({START_H},0,0,0); s.setMinutes(s.getMinutes()+mins);
           const durMin = nearestGridMin(pxToMin(parseFloat(getComputedStyle(bar).height)));
           const e = new Date(s.getTime() + Math.max(durMin, GRID)*60000);
 
           const sink = document.getElementById('drag-update-store');
-          if(sink){ sink.textContent = JSON.stringify({{id: bar.dataset.id, start: toLocalISO(s), end: toLocalISO(e)}}); sink.dispatchEvent(new Event('input')); }
-        };
-      };
+          if(sink){{ sink.textContent = JSON.stringify({{id: bar.dataset.id, start: toLocalISO(s), end: toLocalISO(e)}}); sink.dispatchEvent(new Event('input')); }}
+        }};
+      }};
 
       // リサイズ（下辺）
-      if(handle){
-        handle.onmousedown = (ev)=>{
+      if(handle){{
+        handle.onmousedown = (ev)=>{{
           ev.preventDefault(); resizing=true; bar.classList.add('dragging'); startY = ev.clientY; origH = parseFloat(getComputedStyle(bar).height);
-          document.onmousemove = (mv)=>{
+          document.onmousemove = (mv)=>{{
             if(!resizing) return;
             const dy = mv.clientY - startY;
             let newH = origH + dy;
             const maxH = TOTAL_PX - parseFloat(getComputedStyle(bar).top);
-            newH = clamp(newH, GRID, maxH); bar.style.height = newH + 'px';
+            newH = Math.max(GRID, Math.min(maxH, newH)); bar.style.height = newH + 'px';
 
             const topMin = nearestGridMin(pxToMin(parseFloat(getComputedStyle(bar).top)));
-            const host = pickDayColByPoint(mv.clientX, mv.clientY) || document.querySelector(`.day-col[data-day="${bar.dataset.day}"]`);
-            const g = ensureGhost(host);
-            g.style.top = (topMin)+'px'; g.style.height = nearestGridMin(pxToMin(newH))+'px';
+            const host = pickDayColByPoint(mv.clientX, mv.clientY) || document.querySelector(`.day-col[data-day="${{bar.dataset.day}}"]`);
+            const g = ensureGhost(host); g.style.top = (topMin)+'px'; g.style.height = nearestGridMin(pxToMin(newH))+'px';
 
             const s = new Date(host.dataset.day+'T00:00:00'); s.setHours({START_H},0,0,0); s.setMinutes(s.getMinutes()+topMin);
             const e = new Date(s.getTime() + nearestGridMin(pxToMin(newH))*60000);
             showTip(mv.clientX, mv.clientY, host.dataset.day+'  '+s.toTimeString().slice(0,5)+'–'+e.toTimeString().slice(0,5));
-          };
-          document.onmouseup = (up)=>{
+          }};
+          document.onmouseup = (up)=>{{
             if(!resizing) return; resizing=false; bar.classList.remove('dragging');
             document.onmousemove=null; document.onmouseup=null; hideTip(); removeGhost();
 
@@ -494,20 +479,17 @@ app.layout = dbc.Container(
             const heightPx = parseFloat(getComputedStyle(bar).height);
             const mins = nearestGridMin(pxToMin(topPx));
             const durMin = nearestGridMin(pxToMin(heightPx));
-            const host = pickDayColByPoint(up.clientX, up.clientY) || document.querySelector(`.day-col[data-day="${bar.dataset.day}"]`);
+            const host = pickDayColByPoint(up.clientX, up.clientY) || document.querySelector(`.day-col[data-day="${{bar.dataset.day}}"]`);
             const s = new Date(host.dataset.day+'T00:00:00'); s.setHours({START_H},0,0,0); s.setMinutes(s.getMinutes()+mins);
             const e = new Date(s.getTime() + Math.max(durMin, GRID)*60000);
 
             const sink = document.getElementById('drag-update-store');
-            if(sink){ sink.textContent = JSON.stringify({{id: bar.dataset.id, start: toLocalISO(s), end: toLocalISO(e)}}); sink.dispatchEvent(new Event('input')); }
-          };
-        };
-      }
-    });
-
-    // 週ヘッダ（日名ラベル）クリックでその日の週に留まる→（既に週表示なので）特に無し
-    // 月ビューでのセルクリック→週ジャンプはサーバ側コールバックで処理済み
-  }
+            if(sink){{ sink.textContent = JSON.stringify({{id: bar.dataset.id, start: toLocalISO(s), end: toLocalISO(e)}}); sink.dispatchEvent(new Event('input')); }}
+          }};
+        }};
+      }}
+    }});
+  }}
 
   const obs = new MutationObserver(()=>setup());
   obs.observe(document.documentElement, {{childList:true, subtree:true}});
@@ -557,23 +539,28 @@ def update_current_date(prev_c, next_c, today_c, view_mode, data):
 # 月/週ビュー描画
 @app.callback(
     [Output('calendar-output','children'),
-     Output('current-month-year','children')],
+     Output('current-month-year','children'),
+     Output('undo-button','disabled'),
+     Output('redo-button','disabled')],
     [Input('current-date-store','data'),
      Input('view-switch','value'),
-     Input('events-store','data')]
+     Input('events-store','data'),
+     Input('history-store','data'),
+     Input('future-store','data')]
 )
-def update_calendar_view(date_data, view_mode, events_data):
+def update_calendar_view(date_data, view_mode, events_data, hist, fut):
     year, month = date_data.get('year'), date_data.get('month')
     anchor = datetime.strptime(date_data.get('anchor'),'%Y-%m-%d').replace(tzinfo=TZ)
     if view_mode == 'month':
         comp = generate_month_view(year, month, events_data)
         label = datetime(year, month, 1).strftime('%B %Y')
-        return comp, label
     else:
         comp = generate_week_bars(anchor, events_data)
         s, e = week_range_for_anchor(anchor)
         label = f"{s.strftime('%Y-%m-%d')} – {e.strftime('%Y-%m-%d')}"
-        return comp, label
+    undo_disabled = not hist
+    redo_disabled = not fut
+    return comp, label, undo_disabled, redo_disabled
 
 # 月ビュー → 週へジャンプ（セルクリック）
 @app.callback(
@@ -590,19 +577,76 @@ def jump_to_week(n_clicks, view_mode):
     d = datetime.strptime(date_str, '%Y-%m-%d')
     return {'year': d.year, 'month': d.month, 'anchor': date_str}, 'week'
 
-# Esc / ヘッダクリック → 週→月へ
+# Esc / ヘッダ or Ctrl+Z/Y → UI Intent受け
 @app.callback(
     Output('view-switch','value', allow_duplicate=True),
+    Output('ui-intent','data', allow_duplicate=True),
     Input('ui-intent','children'),
     State('current-date-store','data'),
+    State('view-switch','value'),
     prevent_initial_call=True
 )
-def to_month_from_ui(intent, data):
-    if not intent or intent != 'to-month': raise dash.exceptions.PreventUpdate
-    # anchorの年月を月ビューへ
-    return 'month'
+def handle_ui_intent(intent, date_data, view_mode):
+    if not intent: raise dash.exceptions.PreventUpdate
+    if intent == 'to-month':
+        return 'month', ''
+    # undo/redoはここではviewは変えない→第二のコールバックで履歴更新
+    if intent in ('undo','redo'):
+        return dash.no_update, ''  # 消費して空に戻す
+    raise dash.exceptions.PreventUpdate
 
-# 週ビューのセルクリック → 新規作成モーダル（現在時刻プリセット）
+# ---- Undo/Redo 実装 ----
+def push_history(hist_list, snapshot):
+    hist_list = hist_list or []
+    hist_list = hist_list + [snapshot]
+    if len(hist_list) > HIST_MAX:
+        hist_list = hist_list[-HIST_MAX:]
+    return hist_list
+
+# Undo/Redo ボタン or ショートカット
+@app.callback(
+    Output('events-store','data', allow_duplicate=True),
+    Output('history-store','data', allow_duplicate=True),
+    Output('future-store','data', allow_duplicate=True),
+    Input('undo-button','n_clicks'),
+    Input('redo-button','n_clicks'),
+    Input('ui-intent','children'),  # 'undo' / 'redo' が入る
+    State('events-store','data'),
+    State('history-store','data'),
+    State('future-store','data'),
+    prevent_initial_call=True
+)
+def do_undo_redo(undo_clicks, redo_clicks, intent, events, hist, fut):
+    ctx = dash.callback_context
+    if not ctx.triggered: raise dash.exceptions.PreventUpdate
+    tid = ctx.triggered_id
+    op = None
+    if tid == 'undo-button' or intent == 'undo':
+        op = 'undo'
+    elif tid == 'redo-button' or intent == 'redo':
+        op = 'redo'
+    else:
+        raise dash.exceptions.PreventUpdate
+
+    hist = hist or []
+    fut = fut or []
+    events = events or []
+
+    if op == 'undo':
+        if not hist: raise dash.exceptions.PreventUpdate
+        # 現在をfutureへ、history最後を現在に
+        prev = hist[-1]
+        new_hist = hist[:-1]
+        new_fut = [copy.deepcopy(events)] + fut
+        return copy.deepcopy(prev), new_hist, new_fut
+    else:  # redo
+        if not fut: raise dash.exceptions.PreventUpdate
+        next_state = fut[0]
+        new_fut = fut[1:]
+        new_hist = push_history(hist, copy.deepcopy(events))
+        return copy.deepcopy(next_state), new_hist, new_fut
+
+# 週ビューセルクリック → 新規（履歴はまだ積まない：保存時に積む）
 @app.callback(
     Output('editing-id','data', allow_duplicate=True),
     Output('delete-event-button','disabled', allow_duplicate=True),
@@ -627,7 +671,7 @@ def open_modal_from_week(n_clicks, view_mode):
     s = round_to_grid(s, up=True); e = round_to_grid(s + timedelta(hours=1), up=True)
     return "", True, True, False, "", "", s.strftime('%Y-%m-%dT%H:%M'), e.strftime('%Y-%m-%dT%H:%M'), "Primary"
 
-# JSからの「編集オープン」要求（ダブルクリック）
+# JS→編集オープン
 @app.callback(
     Output('editing-id','data', allow_duplicate=True),
     Output('delete-event-button','disabled', allow_duplicate=True),
@@ -652,12 +696,14 @@ def open_modal_for_edit(edit_id, ev_data):
             parse_iso(target['end']).strftime('%Y-%m-%dT%H:%M'),
             target.get('commitment','Primary'))
 
-# Save / Cancel / Delete
+# Save / Cancel / Delete（履歴に積むのは Save / Delete の直前状態）
 @app.callback(
     Output('event-modal','is_open', allow_duplicate=True),
     Output('modal-error','is_open', allow_duplicate=True),
     Output('modal-error','children', allow_duplicate=True),
     Output('events-store','data', allow_duplicate=True),
+    Output('history-store','data', allow_duplicate=True),
+    Output('future-store','data', allow_duplicate=True),
     Output('editing-id','data', allow_duplicate=True),
     Input('cancel-event-button','n_clicks'),
     Input('save-event-button','n_clicks'),
@@ -667,36 +713,46 @@ def open_modal_for_edit(edit_id, ev_data):
     State('event-end-date','value'),
     State('event-commitment','value'),
     State('events-store','data'),
+    State('history-store','data'),
     State('editing-id','data'),
     prevent_initial_call=True
 )
-def close_save_delete(cancel_c, save_c, delete_c, title, start_val, end_val, commitment, ev_data, editing_id):
+def close_save_delete(cancel_c, save_c, delete_c, title, start_val, end_val, commitment, ev_data, hist, editing_id):
     ctx = dash.callback_context
     if not ctx.triggered: raise dash.exceptions.PreventUpdate
     tid = ctx.triggered_id
+    ev_data = ev_data or []
+    hist = hist or []
 
     # Delete
     if tid == 'delete-event-button':
-        if not editing_id: return False, False, "", dash.no_update, ""
+        if not editing_id: return False, False, "", dash.no_update, dash.no_update, dash.no_update, ""
+        # 履歴に現状態をPush、Redoはクリア
+        new_hist = push_history(hist, copy.deepcopy(ev_data))
+        new_fut = []
         new_list = [e for e in ev_data if e['id'] != editing_id]
-        return False, False, "", new_list, ""
+        return False, False, "", new_list, new_hist, new_fut, ""
 
     # Save
     if tid == 'save-event-button':
         if not start_val or not end_val:
-            return True, True, "Start/End は必須です。", dash.no_update, editing_id
+            return True, True, "Start/End は必須です。", dash.no_update, dash.no_update, dash.no_update, editing_id
         try:
             s = TZ.localize(datetime.strptime(start_val, '%Y-%m-%dT%H:%M'))
             e = TZ.localize(datetime.strptime(end_val,   '%Y-%m-%dT%H:%M'))
         except Exception:
-            return True, True, "日付の形式が不正です。", dash.no_update, editing_id
+            return True, True, "日付の形式が不正です。", dash.no_update, dash.no_update, dash.no_update, editing_id
         if e < s:
-            return True, True, "終了は開始以上である必要があります。", dash.no_update, editing_id
+            return True, True, "終了は開始以上である必要があります。", dash.no_update, dash.no_update, dash.no_update, editing_id
         if (e - s) > timedelta(hours=24):
-            return True, True, "最長24時間までです。", dash.no_update, editing_id
+            return True, True, "最長24時間までです。", dash.no_update, dash.no_update, dash.no_update, editing_id
         s = round_to_grid(s, up=False); e = round_to_grid(e, up=True)
 
-        new_list = copy.deepcopy(ev_data) if isinstance(ev_data, list) else []
+        # 履歴に現状態をPush、Redoはクリア
+        new_hist = push_history(hist, copy.deepcopy(ev_data))
+        new_fut = []
+
+        new_list = copy.deepcopy(ev_data)
         if editing_id:
             for i, ev in enumerate(new_list):
                 if ev['id'] == editing_id:
@@ -709,12 +765,12 @@ def close_save_delete(cancel_c, save_c, delete_c, title, start_val, end_val, com
                              'title': (title or "New Event").strip(),
                              'start': s.isoformat(), 'end': e.isoformat(),
                              'user_id': 'user_a', 'commitment': commitment or "Primary"})
-        return False, False, "", new_list, ""
+        return False, False, "", new_list, new_hist, new_fut, ""
 
     # Cancel
-    return False, False, "", dash.no_update, editing_id
+    return False, False, "", dash.no_update, dash.no_update, dash.no_update, editing_id
 
-# LLM → 新規作成プリセット
+# LLM → 新規作成プリセット（履歴は保存時に積む）
 @app.callback(
     Output('editing-id','data', allow_duplicate=True),
     Output('delete-event-button','disabled', allow_duplicate=True),
@@ -736,15 +792,18 @@ def llm_preset_modal(n_clicks, text):
     msg = f"LLM parsed → Title: {parsed['title']}, Start: {parsed['start']}, End: {parsed['end']}, Commitment: {parsed['commitment']}"
     return "", True, True, False, "", parsed['title'], parsed['start'], parsed['end'], parsed['commitment'], msg
 
-# JSドラッグ更新
+# JSドラッグ更新（適用直前に履歴へ積む）
 @app.callback(
     Output('events-store','data', allow_duplicate=True),
+    Output('history-store','data', allow_duplicate=True),
+    Output('future-store','data', allow_duplicate=True),
     Input('drag-update-store','input'),
     State('drag-update-store','textContent'),
     State('events-store','data'),
+    State('history-store','data'),
     prevent_initial_call=True
 )
-def apply_drag_update(_evt, raw, ev_data):
+def apply_drag_update(_evt, raw, ev_data, hist):
     if not raw: raise dash.exceptions.PreventUpdate
     try:
         payload = json.loads(raw)
@@ -752,20 +811,25 @@ def apply_drag_update(_evt, raw, ev_data):
         raise dash.exceptions.PreventUpdate
     eid, start_s, end_s = payload.get("id"), payload.get("start"), payload.get("end")
     if not (eid and start_s and end_s): raise dash.exceptions.PreventUpdate
+
     s = TZ.localize(datetime.strptime(start_s, '%Y-%m-%dT%H:%M'))
     e = TZ.localize(datetime.strptime(end_s,   '%Y-%m-%dT%H:%M'))
     if e < s: raise dash.exceptions.PreventUpdate
     if (e - s) > timedelta(hours=24): e = s + timedelta(hours=24)
     s = round_to_grid(s, up=False); e = round_to_grid(e, up=True)
 
+    # 履歴に現状態をPush、Redoはクリア
+    new_hist = push_history(hist or [], copy.deepcopy(ev_data or []))
+    new_fut = []
+
     new_list = []
-    for ev in ev_data:
+    for ev in (ev_data or []):
         if ev['id'] == eid:
             upd = ev.copy(); upd['start'] = s.isoformat(); upd['end'] = e.isoformat()
             new_list.append(upd)
         else:
             new_list.append(ev)
-    return new_list
+    return new_list, new_hist, new_fut
 
 if __name__ == '__main__':
     app.run(debug=True)
